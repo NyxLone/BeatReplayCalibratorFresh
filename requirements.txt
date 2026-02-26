@@ -1,3 +1,1 @@
-requests
-PySide6
-py-bsor
+nyx dont analyse the screenshots now they were for informational purposes only . details on there that we need to add into your report. 
