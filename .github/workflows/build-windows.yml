@@ -22,14 +22,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build portable EXE
-        run: |
-          pyinstaller --noconfirm --onefile --windowed ^
-            --name "BeatReplayCalibrator" ^
-            --collect-all bsor ^
-            --collect-all PySide6 ^
-            --hidden-import bsor ^
-            --hidden-import bsor.Bsor ^
-            main.py
+        run: pyinstaller --noconfirm --onefile --windowed --name "BeatReplayCalibrator" main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
