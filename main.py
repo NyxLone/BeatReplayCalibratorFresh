@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import math
 import traceback
 import datetime
 from pathlib import Path
@@ -10,12 +9,11 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QFileDialog, QLineEdit, QMessageBox,
-    QFrame
+    QPushButton, QTextEdit, QFileDialog, QLineEdit, QMessageBox
 )
 
 # -----------------------------
@@ -188,6 +186,8 @@ class App(QWidget):
         layout.addWidget(self.log)
 
         self.bsor_path = None
+        self.worker = None
+
         self.choose_btn.clicked.connect(self.pick)
         self.analyse_btn.clicked.connect(self.run_analysis)
 
@@ -198,11 +198,15 @@ class App(QWidget):
             self.log.append(f"Loaded {path}")
 
     def run_analysis(self):
-    self.log.append("Analysing...")
-    self.worker = Worker(self.bsor_path, self.input.text())
-    self.worker.done.connect(lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}"))
-    self.worker.fail.connect(lambda e: QMessageBox.critical(self, "Error", e))
-    self.worker.start()
+        self.log.append("Analysing...")
+        self.worker = Worker(self.bsor_path, self.input.text())
+        self.worker.done.connect(
+            lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}")
+        )
+        self.worker.fail.connect(
+            lambda e: QMessageBox.critical(self, "Error", e)
+        )
+        self.worker.start()
 
 def main():
     app = QApplication([])
