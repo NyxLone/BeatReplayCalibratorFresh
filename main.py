@@ -6,7 +6,7 @@ import traceback
 import datetime
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -19,13 +19,13 @@ from PySide6.QtWidgets import (
 )
 
 # -----------------------------
-# FIXED BSOR IMPORT (DO NOT TOUCH)
+# LOCAL BSOR PARSER (VENDORED)
 # -----------------------------
-from py_bsor import make_bsor as MAKE_BSOR
+from bsor.parser import make_bsor as MAKE_BSOR
 
 
 APP_NAME = "Beat Replay Calibrator"
-APP_VERSION = "v1.4 (full-report)"
+APP_VERSION = "v1.4 (stable)"
 OUTPUT_ROOT = "BeatSaberReplayAnalysis"
 
 # -----------------------------
@@ -46,28 +46,17 @@ def make_output_folder() -> Path:
     out.mkdir(parents=True, exist_ok=True)
     return out
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
 def mean(xs: List[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
-
-def stdev(xs: List[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    m = mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
 def extract_score_id(text: str) -> Optional[str]:
     if not text:
         return None
-    m = re.search(r"scoreId\s*=\s*(\d+)", text, re.IGNORECASE)
+    m = re.search(r"scoreId\s*=\s*(\d+)", text)
     if m:
         return m.group(1)
     m = re.search(r"\b(\d{6,})\b", text)
-    if m:
-        return m.group(1)
-    return None
+    return m.group(1) if m else None
 
 # -----------------------------
 # BeatLeader download
@@ -80,51 +69,36 @@ def download_bsor(score_id: str) -> bytes:
     return r.content
 
 # -----------------------------
-# Cut data
+# Cut model
 # -----------------------------
 @dataclass
 class Cut:
-    t: float
+    time: float
     hand: str
-    pre: Optional[float]
-    post: Optional[float]
-    acc_dist: Optional[float]
-    x: Optional[float]
-    y: Optional[float]
+    pre: float
+    post: float
+    acc_dist: float
 
 def extract_cuts(bsor) -> List[Cut]:
     cuts: List[Cut] = []
-    notes = getattr(bsor, "noteCuts", None) or []
-    for n in notes:
-        hand = "left" if n.saberType == 0 else "right"
-        c = n.cut
+    for n in getattr(bsor, "notes", []):
         cuts.append(
             Cut(
-                t=n.time,
-                hand=hand,
-                pre=c.beforeCutAngle,
-                post=c.afterCutAngle,
-                acc_dist=c.cutDistanceToCenter,
-                x=c.cutPointX,
-                y=c.cutPointY,
+                time=n["time"],
+                hand="left" if n["saberType"] == 0 else "right",
+                pre=n["preSwing"],
+                post=n["postSwing"],
+                acc_dist=n["cutDistanceToCenter"],
             )
         )
     return cuts
 
 def summarize(cuts: List[Cut]) -> Dict[str, Any]:
-    pres = [c.pre for c in cuts if c.pre is not None]
-    posts = [c.post for c in cuts if c.post is not None]
-    dists = [c.acc_dist for c in cuts if c.acc_dist is not None]
-    xs = [c.x for c in cuts if c.x is not None]
-    ys = [c.y for c in cuts if c.y is not None]
-
     return {
         "count": len(cuts),
-        "pre_avg": mean(pres),
-        "post_avg": mean(posts),
-        "acc_dist_avg": mean(dists),
-        "bias_x_m": mean(xs),
-        "bias_y_m": mean(ys),
+        "pre_avg": mean([c.pre for c in cuts]),
+        "post_avg": mean([c.post for c in cuts]),
+        "acc_dist_avg": mean([c.acc_dist for c in cuts]),
     }
 
 def build_report(bsor) -> Dict[str, Any]:
@@ -141,7 +115,7 @@ def build_report(bsor) -> Dict[str, Any]:
         },
     }
 
-def save_report(report: Dict[str, Any], label: str):
+def save_report(report: Dict[str, Any], label: str) -> Path:
     out = make_output_folder()
     safe = re.sub(r"[^\w\- ]+", "_", label)
     path = out / f"{safe} - {APP_NAME}.json"
@@ -149,28 +123,27 @@ def save_report(report: Dict[str, Any], label: str):
     return path
 
 # -----------------------------
-# Worker
+# Worker thread
 # -----------------------------
 class Worker(QThread):
-    log = Signal(str)
     done = Signal(str)
     fail = Signal(str)
 
-    def __init__(self, path: Optional[str], score: Optional[str]):
+    def __init__(self, bsor_path: Optional[str], score_input: str):
         super().__init__()
-        self.path = path
-        self.score = score
+        self.bsor_path = bsor_path
+        self.score_input = score_input
 
     def run(self):
         try:
-            if self.path:
-                with open(self.path, "rb") as f:
+            if self.bsor_path:
+                with open(self.bsor_path, "rb") as f:
                     bsor = MAKE_BSOR(f)
-                label = Path(self.path).stem
+                label = Path(self.bsor_path).stem
             else:
-                sid = extract_score_id(self.score or "")
+                sid = extract_score_id(self.score_input)
                 if not sid:
-                    raise RuntimeError("No BSOR or scoreId provided")
+                    raise RuntimeError("No BSOR file or valid scoreId provided.")
                 data = download_bsor(sid)
                 import io
                 bsor = MAKE_BSOR(io.BytesIO(data))
@@ -193,42 +166,43 @@ class App(QWidget):
         self.resize(900, 520)
         self.setStyleSheet("background:#111;color:white")
 
-        lay = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+
         title = QLabel(APP_NAME)
         title.setFont(QFont("Segoe UI", 26, QFont.Bold))
-        lay.addWidget(title)
+        layout.addWidget(title)
 
         self.input = QLineEdit()
         self.input.setPlaceholderText("Paste BeatLeader scoreId or replay link")
-        lay.addWidget(self.input)
+        layout.addWidget(self.input)
 
-        btns = QHBoxLayout()
-        self.choose = QPushButton("Choose .bsor")
-        self.run = QPushButton("Analyse")
-        btns.addWidget(self.choose)
-        btns.addWidget(self.run)
-        lay.addLayout(btns)
+        buttons = QHBoxLayout()
+        self.choose_btn = QPushButton("Choose .bsor")
+        self.analyse_btn = QPushButton("Analyse")
+        buttons.addWidget(self.choose_btn)
+        buttons.addWidget(self.analyse_btn)
+        layout.addLayout(buttons)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        lay.addWidget(self.log)
+        layout.addWidget(self.log)
 
-        self.choose.clicked.connect(self.pick)
-        self.run.clicked.connect(self.analyse)
         self.bsor_path = None
+        self.choose_btn.clicked.connect(self.pick)
+        self.analyse_btn.clicked.connect(self.run_analysis)
 
     def pick(self):
-        p, _ = QFileDialog.getOpenFileName(self, "BSOR", "", "*.bsor")
-        if p:
-            self.bsor_path = p
-            self.log.append(f"Loaded {p}")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose BSOR", "", "*.bsor")
+        if path:
+            self.bsor_path = path
+            self.log.append(f"Loaded {path}")
 
-    def analyse(self):
-        self.log.append("Running...")
-        self.worker = Worker(self.bsor_path, self.input.text())
-        self.worker.done.connect(lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}"))
-        self.worker.fail.connect(lambda e: QMessageBox.critical(self, "Error", e))
-        self.worker.start()
+    def run_analysis(self):
+        self.log.append("Analysing...")
+        worker = Worker(self.bsor_path, self.input.text())
+        worker.done.connect(lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}"))
+        worker.fail.connect(lambda e: QMessageBox.critical(self, "Error", e))
+        worker.start()
 
 def main():
     app = QApplication([])
