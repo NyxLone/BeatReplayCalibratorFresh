@@ -23,7 +23,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --windowed main.py --name BeatReplayCalibrator --collect-all PySide6 --collect-all shiboken6
+          pyinstaller --onefile --windowed main.py --name BeatReplayCalibrator --collect-all PySide6 --collect-all shiboken6 --collect-all bsor
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
