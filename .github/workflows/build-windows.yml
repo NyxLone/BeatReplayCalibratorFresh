@@ -23,7 +23,13 @@ jobs:
 
       - name: Build portable EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "BeatReplayCalibrator" --collect-all bsor main.py
+          pyinstaller ^
+            --noconfirm ^
+            --onefile ^
+            --windowed ^
+            --name "BeatReplayCalibrator" ^
+            --collect-all bsor ^
+            main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
