@@ -1,12 +1,10 @@
 import re
 import io
 import json
-import math
 import traceback
 import datetime
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 import requests
 
@@ -17,12 +15,13 @@ from PySide6.QtWidgets import (
     QPushButton, QTextEdit, QFileDialog, QLineEdit, QMessageBox, QFrame
 )
 
-# py-bsor (PyPI)  ✅ NO Scoring import (calc_stats removed)
+# py-bsor (PyPI)
 from bsor.Bsor import make_bsor
+from bsor.Scoring import calc_stats
 
 
 APP_NAME = "Beat Replay Calibrator"
-APP_VERSION = "v2.1 (stable-no-scoring)"
+APP_VERSION = "v2.0 (py-bsor)"
 OUTPUT_ROOT = "BeatSaberReplayAnalysis"
 
 
@@ -67,6 +66,7 @@ def extract_score_id(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def download_bsor_bytes(score_id: str) -> bytes:
+    # BeatLeader CDN direct replay download
     url = f"https://cdn.beatleader.xyz/replays/{score_id}.bsor"
     r = requests.get(url, timeout=30)
     if not r.ok or not r.content:
@@ -75,7 +75,7 @@ def download_bsor_bytes(score_id: str) -> bytes:
 
 
 # -----------------------------
-# Math helpers
+# Analysis helpers
 # -----------------------------
 def mean(xs: List[float]) -> Optional[float]:
     xs = [x for x in xs if x is not None]
@@ -87,21 +87,18 @@ def stdev(xs: List[float]) -> Optional[float]:
         return None
     m = sum(xs) / len(xs)
     var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-    return math.sqrt(var)
+    return var ** 0.5
+
+def pct(part: Optional[float], whole: Optional[float]) -> Optional[float]:
+    if part is None or whole in (None, 0):
+        return None
+    return (part / whole) * 100.0
 
 def as_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
         return float(x)
-    except:
-        return None
-
-def as_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
     except:
         return None
 
@@ -123,259 +120,152 @@ def get_dict(d: Any, *keys: str) -> Any:
 
 
 # -----------------------------
-# Data model
+# Build detailed report
 # -----------------------------
-@dataclass
-class Cut:
-    t: float
-    hand: str                      # "left" / "right"
-    pre: Optional[float]           # degrees
-    post: Optional[float]          # degrees
-    dist: Optional[float]          # meters (distance to center)
-    cut_x: Optional[float]         # cut point x (if available)
-    cut_y: Optional[float]         # cut point y (if available)
-    dir_dev: Optional[float]       # degrees
-    grid_x: Optional[int]          # 0..3
-    grid_y: Optional[int]          # 0..2
-
-
-def iter_notes(bsor_obj: Any) -> List[Any]:
+def build_report(bsor_obj: Any, label: str) -> Dict[str, Any]:
     """
-    py-bsor objects differ by version.
-    Prefer bsor_obj.notes if present, fallback to bsor_obj.noteCuts.
+    Uses calc_stats from py-bsor plus extra breakdowns we can compute safely from notes.
     """
-    notes = getattr(bsor_obj, "notes", None)
-    if isinstance(notes, list) and notes:
-        return notes
-    note_cuts = getattr(bsor_obj, "noteCuts", None)
-    if isinstance(note_cuts, list) and note_cuts:
-        return note_cuts
-    return []
+    # calc_stats returns a stats object/dict-like. We'll convert to JSON safely.
+    stats = calc_stats(bsor_obj)
 
+    # Notes list
+    notes = getattr(bsor_obj, "notes", None) or []
+    note_count = len(notes)
 
-def extract_cuts(bsor_obj: Any) -> List[Cut]:
-    cuts: List[Cut] = []
-    notes = iter_notes(bsor_obj)
+    # We try to pull common per-note cut fields if present
+    # (py-bsor supports multiple schemas / versions)
+    left_dists, right_dists = [], []
+    left_pre, right_pre = [], []
+    left_post, right_post = [], []
+    left_dev, right_dev = [], []
+
+    # 4x3 grid (Beat Saber is 4 columns x 3 rows)
+    grid = [[{"n": 0, "dist_avg": None} for _ in range(4)] for _ in range(3)]
+    grid_acc = [[[] for _ in range(4)] for _ in range(3)]
 
     for n in notes:
+        # py-bsor note can be dict-like or object-like depending on version
+        # Normalize:
         if isinstance(n, dict):
-            t = as_float(get_dict(n, "time", "t", "songTime")) or 0.0
-            saber = as_int(get_dict(n, "saberType", "hand"))
-            pre = as_float(get_dict(n, "preSwing", "beforeCutAngle", "beforeAngle"))
-            post = as_float(get_dict(n, "postSwing", "afterCutAngle", "afterAngle"))
-            dist = as_float(get_dict(n, "cutDistanceToCenter", "distanceToCenter", "accuracyDistance"))
-            cut_x = as_float(get_dict(n, "cutPointX", "x", "offsetX", "cutX"))
-            cut_y = as_float(get_dict(n, "cutPointY", "y", "offsetY", "cutY"))
-            dev = as_float(get_dict(n, "cutDirDeviation", "directionDeviation", "dirDeviationDeg"))
-            gx = as_int(get_dict(n, "lineIndex", "line", "gridX", "x"))
-            gy = as_int(get_dict(n, "lineLayer", "layer", "gridY", "y"))
+            saber = get_dict(n, "saberType", "hand")
+            line = get_dict(n, "lineIndex", "x")
+            layer = get_dict(n, "lineLayer", "y")
+            cut = get_dict(n, "cut")
+            pre = get_dict(n, "preSwing", "beforeCutAngle")
+            post = get_dict(n, "postSwing", "afterCutAngle")
+            dist = get_dict(n, "cutDistanceToCenter", "distanceToCenter")
+            dev = get_dict(n, "cutDirDeviation", "directionDeviation")
         else:
-            t = as_float(get_attr(n, "time", "t", "songTime")) or 0.0
-            saber = as_int(get_attr(n, "saberType", "hand"))
-            # some versions store a cut object with before/after
-            cut_obj = get_attr(n, "cut", "noteCut", "cutInfo")
+            saber = get_attr(n, "saberType", "hand")
+            line = get_attr(n, "lineIndex", "x")
+            layer = get_attr(n, "lineLayer", "y")
+            cut = get_attr(n, "cut")
+            pre = get_attr(n, "preSwing", "beforeCutAngle")
+            post = get_attr(n, "postSwing", "afterCutAngle")
+            dist = get_attr(n, "cutDistanceToCenter", "distanceToCenter")
+            dev = get_attr(n, "cutDirDeviation", "directionDeviation")
 
-            pre = as_float(get_attr(n, "preSwing", "beforeCutAngle", "beforeAngle"))
-            post = as_float(get_attr(n, "postSwing", "afterCutAngle", "afterAngle"))
-            dist = as_float(get_attr(n, "cutDistanceToCenter", "distanceToCenter", "accuracyDistance"))
-            cut_x = as_float(get_attr(n, "cutPointX", "x", "offsetX", "cutX"))
-            cut_y = as_float(get_attr(n, "cutPointY", "y", "offsetY", "cutY"))
-            dev = as_float(get_attr(n, "cutDirDeviation", "directionDeviation", "dirDeviationDeg"))
-            gx = as_int(get_attr(n, "lineIndex", "line", "gridX", "x"))
-            gy = as_int(get_attr(n, "lineLayer", "layer", "gridY", "y"))
+        saber = int(saber) if saber is not None else None
+        pre = as_float(pre)
+        post = as_float(post)
+        dist = as_float(dist)
+        dev = as_float(dev)
 
-            # if missing, try the cut object
-            if cut_obj is not None:
-                if pre is None:
-                    pre = as_float(get_attr(cut_obj, "preSwing", "beforeCutAngle", "beforeAngle"))
-                if post is None:
-                    post = as_float(get_attr(cut_obj, "postSwing", "afterCutAngle", "afterAngle"))
-                if dist is None:
-                    dist = as_float(get_attr(cut_obj, "cutDistanceToCenter", "distanceToCenter", "accuracyDistance"))
-                if cut_x is None:
-                    cut_x = as_float(get_attr(cut_obj, "cutPointX", "x", "offsetX", "cutX"))
-                if cut_y is None:
-                    cut_y = as_float(get_attr(cut_obj, "cutPointY", "y", "offsetY", "cutY"))
-                if dev is None:
-                    dev = as_float(get_attr(cut_obj, "cutDirDeviation", "directionDeviation", "dirDeviationDeg"))
+        if saber == 0:  # left
+            if dist is not None: left_dists.append(dist)
+            if pre is not None: left_pre.append(pre)
+            if post is not None: left_post.append(post)
+            if dev is not None: left_dev.append(dev)
+        elif saber == 1:  # right
+            if dist is not None: right_dists.append(dist)
+            if pre is not None: right_pre.append(pre)
+            if post is not None: right_post.append(post)
+            if dev is not None: right_dev.append(dev)
 
-        hand = "left" if saber == 0 else ("right" if saber == 1 else "unknown")
+        # Grid accumulation if we have line/layer and dist
+        if line is not None and layer is not None and dist is not None:
+            try:
+                x = int(line)
+                y = int(layer)
+                # layer usually 0..2 (bottom..top)
+                if 0 <= x <= 3 and 0 <= y <= 2:
+                    grid_acc[y][x].append(dist)
+            except:
+                pass
 
-        # sanity clamp grid
-        if gx is not None and not (0 <= gx <= 3):
-            gx = None
-        if gy is not None and not (0 <= gy <= 2):
-            gy = None
-
-        cuts.append(Cut(
-            t=t, hand=hand, pre=pre, post=post, dist=dist,
-            cut_x=cut_x, cut_y=cut_y, dir_dev=dev,
-            grid_x=gx, grid_y=gy
-        ))
-
-    return cuts
-
-
-# -----------------------------
-# Summaries
-# -----------------------------
-def summarize(cuts: List[Cut]) -> Dict[str, Any]:
-    pres = [c.pre for c in cuts if c.pre is not None]
-    posts = [c.post for c in cuts if c.post is not None]
-    dists = [c.dist for c in cuts if c.dist is not None]
-    xs = [c.cut_x for c in cuts if c.cut_x is not None]
-    ys = [c.cut_y for c in cuts if c.cut_y is not None]
-    devs = [c.dir_dev for c in cuts if c.dir_dev is not None]
-
-    under_pre = [c for c in cuts if c.pre is not None and c.pre < 100.0]
-    under_post = [c for c in cuts if c.post is not None and c.post < 60.0]
-
-    return {
-        "n": len(cuts),
-        "pre_avg_deg": mean(pres),
-        "pre_std_deg": stdev(pres),
-        "post_avg_deg": mean(posts),
-        "post_std_deg": stdev(posts),
-        "dist_avg_m": mean(dists),
-        "dist_std_m": stdev(dists),
-        "cut_bias_x": mean(xs),          # only if replay provides cut points
-        "cut_bias_y": mean(ys),
-        "cut_std_x": stdev(xs),
-        "cut_std_y": stdev(ys),
-        "dir_dev_avg_deg": mean(devs),
-        "dir_dev_std_deg": stdev(devs),
-        "underswing_rate_pre": (len(under_pre) / len(pres)) if pres else None,
-        "underswing_rate_post": (len(under_post) / len(posts)) if posts else None,
-    }
-
-
-def grid_4x3(cuts: List[Cut]) -> List[List[Dict[str, Any]]]:
-    # [layer][col] (layer 0 bottom, 2 top)
-    acc: List[List[List[float]]] = [[[] for _ in range(4)] for _ in range(3)]
-    for c in cuts:
-        if c.grid_x is None or c.grid_y is None or c.dist is None:
-            continue
-        acc[c.grid_y][c.grid_x].append(c.dist)
-
-    out: List[List[Dict[str, Any]]] = []
+    # finalize grid
     for y in range(3):
-        row = []
         for x in range(4):
-            arr = acc[y][x]
-            row.append({"n": len(arr), "dist_avg_m": mean(arr), "dist_std_m": stdev(arr)})
-        out.append(row)
-    return out
+            arr = grid_acc[y][x]
+            grid[y][x]["n"] = len(arr)
+            grid[y][x]["dist_avg"] = mean(arr)
 
-
-def time_windows(cuts: List[Cut], window_s: float = 10.0) -> List[Dict[str, Any]]:
-    if not cuts:
-        return []
-    max_t = max(c.t for c in cuts)
-    bins = int(math.ceil(max_t / window_s))
-    out: List[Dict[str, Any]] = []
-
-    for i in range(bins):
-        a = i * window_s
-        b = (i + 1) * window_s
-        seg = [c for c in cuts if a <= c.t < b]
-        out.append({
-            "t_start": a,
-            "t_end": b,
-            "all": summarize(seg),
-            "left": summarize([c for c in seg if c.hand == "left"]),
-            "right": summarize([c for c in seg if c.hand == "right"]),
-        })
-    return out
-
-
-def recommend_from_bias(summary_hand: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Only works if replay exposes cut_x/cut_y.
-    Convention:
-      +X means you hit to the right of center -> move controller PositionX negative (left)
-      +Y means you hit above center -> move PositionY negative (down)
-    We apply 50% gain so you don’t overcorrect.
-    """
-    bx = summary_hand.get("cut_bias_x")
-    by = summary_hand.get("cut_bias_y")
-    dev = summary_hand.get("dir_dev_avg_deg")
-
-    rec = {
-        "pos_x_cm": None,
-        "pos_y_cm": None,
-        "rot_y_deg": None,
-        "notes": []
+    # Conservative controller setting suggestion from consistent centre bias:
+    # NOTE: Requires cutPointX/Y or similar; many replays don't expose it cleanly in calc_stats.
+    # We keep placeholder fields and we’ll extend once we confirm where py-bsor exposes cutpoint.
+    recommendations = {
+        "note": "Calibration recommendations need cut-point bias vectors. This version outputs full swing/accuracy stats + grid; next step adds bias → exact X/Y/Z adjustments.",
+        "left": {"pos_x_cm": None, "pos_y_cm": None, "rot_y_deg": None},
+        "right": {"pos_x_cm": None, "pos_y_cm": None, "rot_y_deg": None},
+        "axis_key": {
+            "PositionX": "left/right (cm)",
+            "PositionY": "up/down (cm)",
+            "PositionZ": "forward/back (cm)",
+            "RotationX": "tilt up/down (deg)",
+            "RotationY": "yaw turn (deg)",
+            "RotationZ": "roll twist (deg)",
+        }
     }
 
-    if bx is not None:
-        dx = -bx * 100.0 * 0.5
-        rec["pos_x_cm"] = round(dx, 2)
-        rec["notes"].append(f"cut_bias_x={bx:+.4f} → suggest PositionX {dx:+.2f} cm")
-    else:
-        rec["notes"].append("No cut_bias_x in replay (can’t suggest PositionX).")
-
-    if by is not None:
-        dy = -by * 100.0 * 0.5
-        rec["pos_y_cm"] = round(dy, 2)
-        rec["notes"].append(f"cut_bias_y={by:+.4f} → suggest PositionY {dy:+.2f} cm")
-    else:
-        rec["notes"].append("No cut_bias_y in replay (can’t suggest PositionY).")
-
-    if dev is not None:
-        ry = -dev * 0.5
-        rec["rot_y_deg"] = round(ry, 2)
-        rec["notes"].append(f"dir_dev_avg={dev:+.2f}° → suggest RotationY {ry:+.2f}°")
-    else:
-        rec["notes"].append("No dir_dev_avg in replay (can’t suggest RotationY).")
-
-    return rec
-
-
-def build_report(bsor_obj: Any, label: str) -> Dict[str, Any]:
-    cuts = extract_cuts(bsor_obj)
-    L = [c for c in cuts if c.hand == "left"]
-    R = [c for c in cuts if c.hand == "right"]
-
-    sum_all = summarize(cuts)
-    sum_L = summarize(L)
-    sum_R = summarize(R)
+    # Convert stats to JSON-safe form
+    # py-bsor stats may be a dataclass-like object; we try to serialize robustly
+    def to_jsonable(o: Any) -> Any:
+        if o is None:
+            return None
+        if isinstance(o, (str, int, float, bool)):
+            return o
+        if isinstance(o, dict):
+            return {k: to_jsonable(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [to_jsonable(v) for v in o]
+        if hasattr(o, "__dict__"):
+            return {k: to_jsonable(v) for k, v in o.__dict__.items() if not k.startswith("_")}
+        return str(o)
 
     report = {
         "app": {"name": APP_NAME, "version": APP_VERSION},
         "meta": {
             "label": label,
             "parsed_at": datetime.datetime.now().isoformat(),
-            "cuts_parsed": len(cuts),
-            "source": "py-bsor make_bsor (no Scoring/calc_stats)",
+            "notes_in_replay": note_count,
+            "source": "py-bsor calc_stats + note breakdown",
         },
-        "summary": {
-            "all": sum_all,
-            "left": sum_L,
-            "right": sum_R,
+        "calc_stats": to_jsonable(stats),
+        "breakdown": {
+            "left": {
+                "dist_avg_m": mean(left_dists),
+                "dist_std_m": stdev(left_dists),
+                "pre_avg_deg": mean(left_pre),
+                "post_avg_deg": mean(left_post),
+                "dir_dev_avg_deg": mean(left_dev),
+            },
+            "right": {
+                "dist_avg_m": mean(right_dists),
+                "dist_std_m": stdev(right_dists),
+                "pre_avg_deg": mean(right_pre),
+                "post_avg_deg": mean(right_post),
+                "dir_dev_avg_deg": mean(right_dev),
+            },
+            "grid_4x3_dist_avg_m": grid,  # [layer][column]
         },
-        "grid_4x3": grid_4x3(cuts),
-        "time_windows_10s": time_windows(cuts, window_s=10.0),
-        "recommendations": {
-            "note": "Recommendations only appear when replay provides cut-point bias. Apply HALF first, re-test, then iterate.",
-            "left": recommend_from_bias(sum_L),
-            "right": recommend_from_bias(sum_R),
-            "axis_key": {
-                "PositionX": "left/right (cm)",
-                "PositionY": "up/down (cm)",
-                "PositionZ": "forward/back (cm)",
-                "RotationX": "tilt up/down (deg)",
-                "RotationY": "yaw turn (deg)",
-                "RotationZ": "roll twist (deg)",
-            }
-        },
+        "recommendations": recommendations,
         "glossary": {
-            "pre_avg_deg": "Backswing angle before hit. Higher is better until scoring cap (~100°).",
-            "post_avg_deg": "Follow-through after hit. Higher is better until scoring cap (~60°).",
-            "dist_avg_m": "Avg distance from block center (meters). Lower is better.",
-            "underswing_rate_pre": "Fraction of notes with pre < 100° (simple underswing measure).",
-            "underswing_rate_post": "Fraction of notes with post < 60° (simple underswing measure).",
-            "cut_bias_x/y": "Average cutpoint bias if replay provides it (used for calibration).",
-            "dir_dev_avg_deg": "Average cut direction deviation if replay provides it.",
+            "pre_swing_deg": "Your angle BEFORE the cut. Low pre = underswing (missed points).",
+            "post_swing_deg": "Your follow-through angle AFTER the cut. Low post = underswing (missed points).",
+            "dist_to_center_m": "How far from block center you cut (meters). Closer = better.",
+            "dir_dev_deg": "Deviation between ideal cut direction and your cut direction.",
+            "grid_4x3": "Beat Saber lane grid: 4 columns (0-3) x 3 layers (0 bottom, 2 top).",
         }
     }
 
@@ -383,8 +273,8 @@ def build_report(bsor_obj: Any, label: str) -> Dict[str, Any]:
 
 
 def build_human_txt(report: Dict[str, Any]) -> str:
-    L = report["summary"]["left"]
-    R = report["summary"]["right"]
+    bL = report["breakdown"]["left"]
+    bR = report["breakdown"]["right"]
 
     def f(v, unit=""):
         if v is None:
@@ -396,38 +286,46 @@ def build_human_txt(report: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"{APP_NAME} {APP_VERSION}")
     lines.append("")
-    lines.append("SUMMARY")
-    lines.append(f"- Cuts parsed: {report['meta']['cuts_parsed']}")
+    lines.append("PLAIN ENGLISH KEY")
+    lines.append("- Pre-swing: backswing before contact (more = better, up to scoring cap)")
+    lines.append("- Post-swing: follow-through after contact (more = better, up to scoring cap)")
+    lines.append("- Dist-to-center: how far from center you hit (smaller = better)")
+    lines.append("- Dir deviation: how off-angle your cut is (smaller = better)")
+    lines.append("")
+    lines.append("BREAKDOWN")
     lines.append("")
     lines.append("LEFT HAND")
-    lines.append(f"- Pre avg: {f(L.get('pre_avg_deg'), '°')}  | Post avg: {f(L.get('post_avg_deg'), '°')}")
-    lines.append(f"- Dist avg: {f(L.get('dist_avg_m'), ' m')} (lower=better)")
-    lines.append(f"- Underswing pre: {f(L.get('underswing_rate_pre'))} | Underswing post: {f(L.get('underswing_rate_post'))}")
-    lines.append(f"- Bias X/Y: {f(L.get('cut_bias_x'))} / {f(L.get('cut_bias_y'))}")
+    lines.append(f"  Dist avg: {f(bL['dist_avg_m'], ' m')}   (lower is better)")
+    lines.append(f"  Dist std: {f(bL['dist_std_m'], ' m')}")
+    lines.append(f"  Pre avg:  {f(bL['pre_avg_deg'], ' °')}")
+    lines.append(f"  Post avg: {f(bL['post_avg_deg'], ' °')}")
+    lines.append(f"  Dir dev:  {f(bL['dir_dev_avg_deg'], ' °')}")
     lines.append("")
     lines.append("RIGHT HAND")
-    lines.append(f"- Pre avg: {f(R.get('pre_avg_deg'), '°')}  | Post avg: {f(R.get('post_avg_deg'), '°')}")
-    lines.append(f"- Dist avg: {f(R.get('dist_avg_m'), ' m')} (lower=better)")
-    lines.append(f"- Underswing pre: {f(R.get('underswing_rate_pre'))} | Underswing post: {f(R.get('underswing_rate_post'))}")
-    lines.append(f"- Bias X/Y: {f(R.get('cut_bias_x'))} / {f(R.get('cut_bias_y'))}")
+    lines.append(f"  Dist avg: {f(bR['dist_avg_m'], ' m')}   (lower is better)")
+    lines.append(f"  Dist std: {f(bR['dist_std_m'], ' m')}")
+    lines.append(f"  Pre avg:  {f(bR['pre_avg_deg'], ' °')}")
+    lines.append(f"  Post avg: {f(bR['post_avg_deg'], ' °')}")
+    lines.append(f"  Dir dev:  {f(bR['dir_dev_avg_deg'], ' °')}")
     lines.append("")
-    lines.append("RECOMMENDATIONS")
+    lines.append("GRID (4x3) dist-to-center averages (meters)")
+    lines.append("Rows: 2 top, 1 mid, 0 bottom | Cols: 0..3 left→right")
+    grid = report["breakdown"]["grid_4x3_dist_avg_m"]
+    for y in (2, 1, 0):
+        row = []
+        for x in range(4):
+            row.append(f(grid[y][x]["dist_avg"], ""))
+        lines.append(f"  Layer {y}: " + " | ".join(row))
+    lines.append("")
+    lines.append("NOTE")
     lines.append(report["recommendations"]["note"])
-    for side in ("left", "right"):
-        rec = report["recommendations"][side]
-        lines.append(f"{side.upper()}:")
-        lines.append(f"  PositionX: {rec.get('pos_x_cm')}")
-        lines.append(f"  PositionY: {rec.get('pos_y_cm')}")
-        lines.append(f"  RotationY: {rec.get('rot_y_deg')}")
-        for n in rec.get("notes", []):
-            lines.append(f"   - {n}")
     lines.append("")
-    lines.append("Saved in: Documents\\" + OUTPUT_ROOT)
+    lines.append("Outputs saved in Documents\\" + OUTPUT_ROOT)
 
     return "\n".join(lines)
 
 
-def save_outputs(report: Dict[str, Any], label: str) -> Tuple[Path, Path]:
+def save_outputs(report: Dict[str, Any], label: str) -> (Path, Path):
     out_dir = make_output_folder()
     base = safe_name(label)
     json_path = out_dir / f"{base} - {APP_NAME} {APP_VERSION}.json"
@@ -455,7 +353,6 @@ class Worker(QThread):
     def run(self):
         try:
             label = ""
-
             if self.bsor_path:
                 self.log.emit(f"Loading file: {self.bsor_path}")
                 label = Path(self.bsor_path).stem
@@ -472,7 +369,7 @@ class Worker(QThread):
                 bsor_obj = make_bsor(io.BytesIO(data))
                 label = f"scoreId_{sid}"
 
-            self.log.emit("Building report (stable-no-scoring)...")
+            self.log.emit("Calculating stats (py-bsor calc_stats)...")
             report = build_report(bsor_obj, label)
 
             self.log.emit("Writing outputs...")
@@ -483,7 +380,7 @@ class Worker(QThread):
         except Exception as e:
             tb = traceback.format_exc()
             crash_path = write_crash_log(tb)
-            self.error.emit(f"{e}\n\nCrash log saved to:\n{crash_path}\n\n{tb}")
+            self.error.emit(f"{e}\n\nFull crash log saved to:\n{crash_path}\n\n{tb}")
 
 
 # -----------------------------
