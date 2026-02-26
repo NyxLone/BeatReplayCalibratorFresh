@@ -198,11 +198,11 @@ class App(QWidget):
             self.log.append(f"Loaded {path}")
 
     def run_analysis(self):
-        self.log.append("Analysing...")
-        worker = Worker(self.bsor_path, self.input.text())
-        worker.done.connect(lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}"))
-        worker.fail.connect(lambda e: QMessageBox.critical(self, "Error", e))
-        worker.start()
+    self.log.append("Analysing...")
+    self.worker = Worker(self.bsor_path, self.input.text())
+    self.worker.done.connect(lambda p: QMessageBox.information(self, "Done", f"Saved:\n{p}"))
+    self.worker.fail.connect(lambda e: QMessageBox.critical(self, "Error", e))
+    self.worker.start()
 
 def main():
     app = QApplication([])
